@@ -1,0 +1,38 @@
+{
+ "description": "Lone Echo 2 (libovr, D3D12) loaded by its own LIBOVR loader straight onto OVRShim (E:\\Lone Echo2\\bin\\win10\\openxr\\LibOVRRT64_1.dll) -> lab host + mock headset. Exploratory: no pass criteria beyond the host seeing frames; read ovrshim.log and the game's r14logs.",
+ "topology": {
+  "host": "builder",
+  "client": "builder",
+  "client_bind_ip": "127.0.0.2",
+  "host_launch": "interactive"
+ },
+ "session_overrides": {},
+ "host": {
+  "shim": true,
+  "fps": 90,
+  "seconds": 75,
+  "connect_timeout": 45,
+  "gpu_keepalive": 90
+ },
+ "client": {
+  "seconds": 70,
+  "connect_timeout": 45,
+  "yaw_amp": 0.5,
+  "yaw_hz": 0.25
+ },
+ "client_env": {
+  "RUST_LOG": "warn"
+ },
+ "app": {
+  "exe": "custom",
+  "cwd": "E:\\Lone Echo2\\bin\\win10",
+  "command": "start \"\" /b \"E:\\Lone Echo2\\bin\\win10\\loneecho2.exe\" & timeout /t 55 /nobreak >nul & taskkill /f /im loneecho2.exe",
+  "frames": 0,
+  "timeout_s": 70
+ },
+ "gpu_sample": true,
+ "timeout_s": 240,
+ "checks": {
+  "host_min_frames": 1
+ }
+}
