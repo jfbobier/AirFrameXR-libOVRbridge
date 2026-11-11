@@ -11,3 +11,7 @@ AirFrameXR's lab (`harness/` in the [AirFrameXR](https://github.com/jfbobier/Air
 Pass criteria are only that the host sees frames and the mock client streams (`host_frames_sent`, `client_streaming`); the xr_probe-specific checks (`app_exit_ok`, duplicate timestamps) report FAIL for a game and can be ignored. Read the lab's `ovrshim.log` and decode `client.hevc` to look at the picture.
 
 Last result (2026-11-11, RTX 5090, Lone Echo II build 0x61578052): launcher scenario with the 1.0.0 release build: signature patch and `--texture-budget 2` applied, 3819 frames sent to the mock headset.
+
+## Watching the monitor (the desktop-window flicker)
+
+`e2e_le2_screen.json` is the launcher scenario plus `watch.ps1` (run on the lab PC as `_tmp\watch.ps1`): it samples the primary screen every ~120 ms without touching any window and writes the mean and centre colour of each sample, plus a few screenshots. With Lone Echo II the monitor shows a flat colour that changes at random (blue-grey to dark); it did so with the shim's mirror texture drawn, kept black, and refused altogether, so it is the game's own window.

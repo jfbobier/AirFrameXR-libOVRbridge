@@ -1,0 +1,38 @@
+{
+ "description": "e2e_le2_launcher plus a watch of the real monitor (mean/centre colour every ~120 ms, a few screenshots) while the game runs: the 'blue-black' flicker.",
+ "topology": {
+  "host": "builder",
+  "client": "builder",
+  "client_bind_ip": "127.0.0.2",
+  "host_launch": "interactive"
+ },
+ "session_overrides": {},
+ "host": {
+  "shim": true,
+  "fps": 90,
+  "seconds": 75,
+  "connect_timeout": 45,
+  "gpu_keepalive": 90
+ },
+ "client": {
+  "seconds": 70,
+  "connect_timeout": 45,
+  "yaw_amp": 0.5,
+  "yaw_hz": 0.25
+ },
+ "client_env": {
+  "RUST_LOG": "warn"
+ },
+ "app": {
+  "exe": "custom",
+  "cwd": "%USERPROFILE%\\vision-alvr",
+  "command": "mkdir %USERPROFILE%\\vision-alvr\\runs\\watch4 2>nul & _tmp\\lb\\dist\\libovr_launch.exe --texture-budget 2 \"C:\\Games\\Lone Echo2\\bin\\win10\\loneecho2.exe\" & timeout /t 25 /nobreak >nul & powershell -NoProfile -ExecutionPolicy Bypass -File _tmp\\watch.ps1 %USERPROFILE%\\vision-alvr\\runs\\watch4 40 > %USERPROFILE%\\vision-alvr\\runs\\watch4\\watch.txt 2>&1 & taskkill /f /im loneecho2.exe",
+  "frames": 0,
+  "timeout_s": 70
+ },
+ "gpu_sample": true,
+ "timeout_s": 240,
+ "checks": {
+  "host_min_frames": 1
+ }
+}
