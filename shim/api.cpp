@@ -197,6 +197,13 @@ ovr_GetTrackingState(ovrSession session, double absTime, ovrBool latencyMarker) 
     return trackingState;
 }
 
+// Not in the public headers: some games (Arktika.1) make their libovr loader require this export and refuse to start without it
+// (ovrError_LibLoad). The extra trailing argument (a sensor-data output in the Oculus runtime) is ignored here.
+OVR_PUBLIC_FUNCTION(ovrTrackingState)
+ovr_GetTrackingStateWithSensorData(ovrSession session, double absTime, ovrBool latencyMarker, void* sensorData) {
+    return ovr_GetTrackingState(session, absTime, latencyMarker);
+}
+
 OVR_PUBLIC_FUNCTION(ovrResult)
 ovr_GetDevicePoses(ovrSession session,
                    ovrTrackedDeviceType* deviceTypes,

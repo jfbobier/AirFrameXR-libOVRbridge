@@ -1,0 +1,38 @@
+{
+ "description": "Arktika.1 (D3D11 libovr game) started by libovr_launch.exe (the AirFrameXR libOVR bridge release build: launcher + bin\\LibOVRRT64_1.dll from _tmp\\lb\\dist), no winmm.dll in the game folder -> lab host + mock headset.",
+ "topology": {
+  "host": "builder",
+  "client": "builder",
+  "client_bind_ip": "127.0.0.2",
+  "host_launch": "interactive"
+ },
+ "session_overrides": {},
+ "host": {
+  "shim": true,
+  "fps": 90,
+  "seconds": 75,
+  "connect_timeout": 45,
+  "gpu_keepalive": 90
+ },
+ "client": {
+  "seconds": 70,
+  "connect_timeout": 45,
+  "yaw_amp": 0.5,
+  "yaw_hz": 0.25
+ },
+ "client_env": {
+  "RUST_LOG": "warn"
+ },
+ "app": {
+  "exe": "custom",
+  "cwd": "%USERPROFILE%\\vision-alvr",
+  "command": "_tmp\\lb\\dist\\libovr_launch.exe \"E:\\Arktika.1\\arktika1.exe\" & timeout /t 60 /nobreak >nul & taskkill /f /im arktika1.exe",
+  "frames": 0,
+  "timeout_s": 70
+ },
+ "gpu_sample": true,
+ "timeout_s": 240,
+ "checks": {
+  "host_min_frames": 1
+ }
+}
