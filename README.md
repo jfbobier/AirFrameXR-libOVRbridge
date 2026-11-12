@@ -1,21 +1,29 @@
-# AirFrameXR libOVR bridge
+# AirFrameXR libOVR bridge (experimental)
 
-Run old **libovr** (Oculus Rift SDK) PC VR games on a headset streamed by [AirFrameXR](https://github.com/jfbobier/AirFrameXR), for example an Apple Vision Pro, with no Oculus software, no SteamVR and no OpenXR translation layer in between. The game talks libovr straight to a `LibOVRRT64_1.dll` that hands its frames to the AirFrameXR streamer.
+An **experimental** bridge that lets old **libovr** (Oculus Rift SDK) PC VR games talk to a headset streamed by [AirFrameXR](https://github.com/jfbobier/AirFrameXR), for example an Apple Vision Pro, with no Oculus software, no SteamVR and no OpenXR translation layer in between. The game talks libovr straight to a `LibOVRRT64_1.dll` that hands its frames to the AirFrameXR streamer.
 
 Windows + NVIDIA only (like AirFrameXR). MIT licensed.
+
+**Set your expectations low.** This is a hobby-grade experiment, not a supported feature of AirFrameXR. It has been tried on one game, one PC and one headset, and it breaks easily (see below). If a game does not start, shows no picture or stutters, that is the expected outcome more often than not. There is no support and no promise that a game will ever work.
 
 ## Status, honestly
 
 | | |
 |---|---|
-| Played and checked | **Lone Echo II** (final Oculus build 1.1.561021.2, a D3D12 game) on an Apple Vision Pro, RTX 5090, AirFrameXR 1.3.9: it renders, tracks, and the owner felt the controller haptics. Steady at 100 fps once the link was fixed (the wireless link, not this project, was what stuttered; see AirFrameXR's docs). |
-| Not tested | other libovr games, D3D11 libovr games (the D3D11 path is OVRNull's, unchanged), other GPUs, Quest headsets, controller input beyond a short play, the texture-budget patch in a long session. |
-| Known limits | **Lone Echo II's desktop window flickers** (flat blue/black colours) while it runs. It does so with the shim's mirror texture drawn, kept black, and refused altogether, so it is the game's own window and not this project's output; the headset picture is not affected. D3D12 mirror textures are accepted but not drawn. No boundary / guardian. Only Lone Echo II build `0x61578052` is in the launcher's patch table; other games need their own entry (below). |
+| Tried | One libovr game (a D3D12 title, final Oculus build) on an Apple Vision Pro, RTX 5090: it rendered, tracked, and controller haptics were felt. That is the whole test history. |
+| Not tested | any other game, D3D11 libovr games (that path is OVRNull's, unchanged), other GPUs, Quest headsets, controller input beyond a short play, long sessions. |
+| Known limits | The game's own desktop window may flicker while it runs (independent of this project's mirror texture; the headset picture is not affected). D3D12 mirror textures are accepted but not drawn. No boundary / guardian. Haptics are a simple approximation. Each game needs its own entry in the launcher's patch table (below); only one build is in it today. |
+
+### Why it breaks easily
+
+* **It is tied to one AirFrameXR version.** The bridge carries a copy of AirFrameXR's IPC header and the streamer refuses a mismatch (the game's log then says `AirFrameXR host not reachable (not running, or a different version)` and no picture arrives). An AirFrameXR update that changes the IPC needs a matching rebuild of this bridge. It broke exactly like that when AirFrameXR moved to 1.3.10 until it was rebuilt.
+* **It patches the game in memory** to get past the libovr loader's signature check, with offsets that are only valid for the exact exe builds in the launcher's table. Any other build is refused or not patched.
+* **It relies on the game's libovr behaviour** as it was in the Oculus era; anything a game does that the shim does not implement fails quietly.
 
 ## What you need
 
-1. [AirFrameXR](https://github.com/jfbobier/AirFrameXR) **1.3.9 or newer**, set up and connected to your headset (this project speaks its IPC version 36).
-2. A libovr game on this PC that you can run.
+1. [AirFrameXR](https://github.com/jfbobier/AirFrameXR) at the version this release was built for, set up and connected to your headset: **1.3.10 (IPC version 37)**. Check the version before blaming anything else.
+2. A libovr game on this PC that you can run, whose exe build is in the launcher's table.
 3. This release: `libovr_launch.exe` and `bin\LibOVRRT64_1.dll`, kept together in one folder anywhere.
 
 ## Use
@@ -24,13 +32,12 @@ Windows + NVIDIA only (like AirFrameXR). MIT licensed.
 2. Start the game through the launcher instead of its own exe:
 
 ```
-libovr_launch.exe "D:\Games\Lone Echo 2\bin\win10\loneecho2.exe"
-libovr_launch.exe --texture-budget 2 "D:\Games\Lone Echo 2\bin\win10\loneecho2.exe"
+libovr_launch.exe "D:\Games\SomeGame\bin\win10\game.exe"
 ```
 
-Nothing is installed in the game folder and no system setting changes. Remove the game's folder-side leftovers from other mods (`winmm.dll` from a mod loader, an `openxr` bridge folder) so that only one thing steers the libovr loader. The launcher writes `libovr_launch.log` next to itself and the bridge writes its log to `logs\AirFrameXR.log` next to `bin\`.
+Nothing is installed in the game folder and no system setting changes. Remove the game's folder-side leftovers from other mods (`winmm.dll` from a mod loader, an `openxr` bridge folder) so that only one thing steers the libovr loader. The launcher writes `libovr_launch.log` next to itself and the bridge writes its log to `logs\AirFrameXR.log` next to `bin\`; those are the first places to look when it does not work.
 
-`--texture-budget 2|4` (Lone Echo II only, optional): the game sets its texture cache budget from the Texture quality setting and never looks at your VRAM (768 MiB, 1.5 GiB, 3 GiB), which makes textures drop to low detail and stay there. x2 suits GPUs with 12 GB or more, x4 GPUs with 16 GB or more; x4 also re-evaluates every object every frame and resumes mip upgrades after 1 s instead of 5 s. It replaces the discontinued community "VEGA patch" in effect, not in method: VEGA swapped NVIDIA driver profiles, this edits the game's own budget in memory.
+`--texture-budget 2|4` (optional, only for the game build that has such an entry in the table): raises the game's in-memory texture cache budget, which the game otherwise sets from its quality setting without looking at your VRAM. x2 suits GPUs with 12 GB or more, x4 GPUs with 16 GB or more.
 
 ## How it works
 
