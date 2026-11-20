@@ -16,13 +16,13 @@ Windows + NVIDIA only (like AirFrameXR). MIT licensed.
 
 ### Why it breaks easily
 
-* **It is tied to one AirFrameXR version.** The bridge carries a copy of AirFrameXR's IPC header and the streamer refuses a mismatch (the game's log then says `AirFrameXR host not reachable (not running, or a different version)` and no picture arrives). An AirFrameXR update that changes the IPC needs a matching rebuild of this bridge. It broke exactly like that when AirFrameXR moved to 1.3.10 until it was rebuilt.
+* **It is tied to one AirFrameXR version.** The bridge carries a copy of AirFrameXR's IPC header and the streamer refuses a mismatch (the game's log then says `AirFrameXR host not reachable (not running, or a different version)` and no picture arrives). An AirFrameXR update that changes the IPC needs a matching rebuild of this bridge. It broke exactly like that when AirFrameXR moved to 1.3.10 and again with 1.4.1, each time until it was rebuilt.
 * **It patches the game in memory** to get past the libovr loader's signature check, with offsets that are only valid for the exact exe builds in the launcher's table. Any other build is refused or not patched.
 * **It relies on the game's libovr behaviour** as it was in the Oculus era; anything a game does that the shim does not implement fails quietly.
 
 ## What you need
 
-1. [AirFrameXR](https://github.com/jfbobier/AirFrameXR) at the version this release was built for, set up and connected to your headset: **1.3.10 (IPC version 37)**. Check the version before blaming anything else.
+1. [AirFrameXR](https://github.com/jfbobier/AirFrameXR) at the version this release was built for, set up and connected to your headset: **1.4.1 (IPC version 38)**. Check the version before blaming anything else.
 2. A libovr game on this PC that you can run, whose exe build is in the launcher's table.
 3. This release: `libovr_launch.exe` and `bin\LibOVRRT64_1.dll`, kept together in one folder anywhere.
 

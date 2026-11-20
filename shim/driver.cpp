@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <deque>
 #include <mmdeviceapi.h>
 #include <d3d11_4.h>
@@ -62,6 +63,7 @@ using namespace airframexr_ipc;
 
 namespace shimlog {
     static std::mutex g_mutex;
+    static std::mutex g_fileMutex;               // the file handles (g_env, g_session) and the writes to them
     static FILE* g_env = nullptr;     // OVRSHIM_LOG (harness / manual debugging)
     static FILE* g_session = nullptr; // shim_<exe>_<pid>.log in the host's debug session folder
     static std::vector<std::string> g_pending;
@@ -111,11 +113,70 @@ namespace shimlog {
         return b;
     }
 
+    // The host's log ring (ipc.h LogRing): set when the IPC block is open. Lines go to the host, whose writer thread owns the files.
+    static airframexr_ipc::LogRing* g_ring = nullptr;
+    static const volatile uint32_t* g_hostAlive = nullptr;
+    static const volatile uint32_t* g_hostLevel = nullptr;
+
+    static void SetRing(airframexr_ipc::IpcState* st) {
+        g_hostAlive = st ? &st->host.hostAlive : nullptr;
+        g_hostLevel = st ? &st->host.logLevel : nullptr;
+        g_ring = st ? &st->log : nullptr;
+    }
+
+    // The host's verbosity (error 0 .. debug 4); info until a host says otherwise.
+    static uint32_t HostLevel() { return g_hostLevel ? (*g_hostLevel ? *g_hostLevel : 2u) : 2u; }
+
+    // Is a host alive to drain the ring? Its heartbeat moves every vsync: unchanged for 2 s = gone (the line then goes to the file itself).
+    static bool HostDraining() {
+        if (!g_ring || !g_hostAlive) return false;
+        static uint32_t last = 0;
+        static DWORD changed = 0;
+        const uint32_t now = *g_hostAlive;
+        const DWORD t = GetTickCount();
+        if (now != last || changed == 0) { last = now; changed = t; }
+        return now != 0 && (t - changed) < 2000;
+    }
+
+    // One line into the ring. True when the ring took it (or counted it as dropped: a full ring is the host not draining, the file would not help).
+    static bool Push(uint32_t level, const char* comp, const std::string& stamp, const std::string& text) {
+        if (!HostDraining()) return false;
+        airframexr_ipc::LogRing& r = *g_ring;
+        const uint32_t me = GetTickCount() | 1u;
+        bool locked = false;
+        for (int spin = 0; spin < 20000 && !locked; spin++) {
+            uint32_t exp = 0;
+            if (r.lock.compare_exchange_weak(exp, me)) { locked = true; break; }
+            if (exp != 0 && spin % 256 == 255 && (GetTickCount() - (exp & ~1u)) > 50 && r.lock.compare_exchange_strong(exp, me)) { locked = true; break; }   // a dead owner
+            YieldProcessor();
+        }
+        if (!locked) { r.dropped.fetch_add(1); return true; }
+        const uint32_t e = r.enq.load(std::memory_order_relaxed);
+        if (e - r.deq.load(std::memory_order_acquire) >= airframexr_ipc::kLogSlots) {
+            r.dropped.fetch_add(1);
+        } else {
+            airframexr_ipc::LogSlot& s = r.slot[e % airframexr_ipc::kLogSlots];
+            s.pid = GetCurrentProcessId();
+            s.level = level;
+            strncpy_s(s.stamp, sizeof(s.stamp), stamp.c_str(), _TRUNCATE);
+            strncpy_s(s.comp, sizeof(s.comp), comp, _TRUNCATE);
+            strncpy_s(s.text, sizeof(s.text), text.c_str(), _TRUNCATE);
+            r.enq.store(e + 1, std::memory_order_release);
+        }
+        r.lock.store(0, std::memory_order_release);
+        return true;
+    }
+
     static void General(const char* level, const char* fmt, ...) {
         va_list a;
         va_start(a, fmt);
         const std::string msg = Format(fmt, a);
         va_end(a);
+        const std::string who = "shim:" + Utf8(ExeName());
+        const uint32_t lvl = _stricmp(level, "ERROR") == 0 ? 0u : _stricmp(level, "WARN") == 0 ? 1u : 2u;
+        if (lvl > HostLevel()) return;
+        if (Push(lvl, who.c_str(), Now(), msg)) return;
+        // no host to take it (the game runs alone, or the host is gone): the line is appended to the file here, one WriteFile
         static const std::wstring path = [] {
             // the DLL sits in <package>\bin\: the logs are in the package root
             std::wstring root = DllDir();
@@ -124,12 +185,11 @@ namespace shimlog {
             CreateDirectoryW(logs.c_str(), nullptr);
             return logs + L"\\AirFrameXR.log";
         }();
-        static const std::string who = "[shim:" + Utf8(ExeName()) + "]";
         std::string lv = level;
         if (lv.size() < 5) {
             lv.append(5 - lv.size(), ' ');
         }
-        const std::string line = Now() + " " + who + " " + lv + " " + msg + "\r\n";
+        const std::string line = Now() + " [" + who + "] " + lv + " " + msg + "\r\n";
         HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
                                FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h != INVALID_HANDLE_VALUE) {
@@ -157,6 +217,7 @@ namespace shimlog {
     // Opens the debug log in the host's debug session folder (empty: debug off).
     static void SetDebugDir(const std::wstring& dir) {
         std::lock_guard lock(g_mutex);
+        std::lock_guard fl(g_fileMutex);
         InitEnvLocked();
         if (g_dirKnown && dir == g_debugDir) {
             return;
@@ -187,6 +248,34 @@ namespace shimlog {
         g_pending.clear();
     }
 
+    // The debug log is written by a thread of its own (no disk write, and no lock held across one, on the game's threads): Debug() formats the line and
+    // queues it (bounded; a full queue drops and counts), the thread appends the batch to the files every 200 ms.
+    static std::deque<std::string> g_queue;      // guarded by g_mutex
+    static std::condition_variable_any g_queueCv;
+    static std::atomic<uint64_t> g_queueDropped{0};
+    static bool g_writerStarted = false;
+
+    static void WriterLoop() {
+        uint64_t reported = 0;
+        for (;;) {
+            std::deque<std::string> batch;
+            {
+                std::unique_lock lock(g_mutex);
+                g_queueCv.wait_for(lock, std::chrono::milliseconds(200), [] { return !g_queue.empty(); });
+                batch.swap(g_queue);
+            }
+            std::lock_guard fl(g_fileMutex);
+            const uint64_t d = g_queueDropped.load();
+            if (d > reported) { batch.push_back(Now() + " [" + std::to_string(GetCurrentProcessId()) + "] shim debug log: " + std::to_string(d - reported) + " lines dropped (queue full)\n"); reported = d; }
+            if (batch.empty()) continue;
+            for (FILE* f : { g_env, g_session }) {
+                if (!f) continue;
+                for (const auto& l : batch) fputs(l.c_str(), f);
+                fflush(f);
+            }
+        }
+    }
+
     static void Debug(const char* fmt, ...) {
         std::lock_guard lock(g_mutex);
         InitEnvLocked();
@@ -196,16 +285,14 @@ namespace shimlog {
         snprintf(pid, sizeof(pid), " [%lu] ", GetCurrentProcessId());
         const std::string line = Now() + pid + Format(fmt, a) + "\n";
         va_end(a);
-        if (g_env) {
-            fputs(line.c_str(), g_env);
-            fflush(g_env);
+        if (!g_writerStarted) { g_writerStarted = true; std::thread(WriterLoop).detach(); }
+        if (!g_dirKnown && !g_env) {
+            if (g_pending.size() < 200) g_pending.push_back(line); // until the host says whether debug is on
+            return;
         }
-        if (g_session) {
-            fputs(line.c_str(), g_session);
-            fflush(g_session);
-        } else if (!g_dirKnown && g_pending.size() < 200) {
-            g_pending.push_back(line); // until the host says whether debug is on
-        }
+        if (g_queue.size() >= 8192) { g_queueDropped++; return; }
+        g_queue.push_back(line);
+        g_queueCv.notify_one();
     }
 
     // Per-frame trace (follow-the-frames harness): one CSV line per published frame, in the debug session folder
@@ -263,6 +350,90 @@ struct FrameTraceRow {
 // VDXR's own extension flags (virtualdesktop-openxr/OVR_Ext.h): layer shown to one eye only.
 static constexpr int kLayerFlagDisableLeft = 0x100000;
 static constexpr int kLayerFlagDisableRight = 0x200000;
+// The AirFrameXR fork of VDXR (OVR_Ext.h there), only when ovrshim_Capabilities reports bit 0: the layer's swapchain is a texture
+// array read in place (no copy of slices above 0 into a second swapchain); eye e reads slice (Flags >> (24 + 4 e)) & 0xF, a quad
+// or cylinder the eye-0 field. Without the flag every slice is 0.
+static constexpr unsigned kLayerFlagArraySlices = 0x400000;
+// the shaders' cbuffer offsets of the slice field (fxc reflection of ReprojectPS.hlsl / LayerPS.hlsl, 2026-11-18)
+static_assert(offsetof(ConstantsBuffer, slice) == 116, "ConstantsBuffer layout must match ReprojectPS.hlsl");
+static_assert(offsetof(LayerConstants, slice) == 276, "LayerConstants layout must match LayerPS.hlsl");
+static UINT LayerSlice(unsigned flags, int eye, const ovrTextureSwapChainDesc& d) {
+    if (!(flags & kLayerFlagArraySlices)) {
+        return 0;
+    }
+    return std::min<UINT>((flags >> (24 + 4 * eye)) & 0xF, std::max(1, d.ArraySize) - 1);
+}
+extern "C" __declspec(dllexport) uint32_t __cdecl ovrshim_Capabilities() {
+    return 1u; // bit 0: texture-array slices in place (kLayerFlagArraySlices)
+}
+
+// Per-frame facts from the OpenXR runtime that the libOVR API cannot carry: when the app's frame really started
+// (xrWaitFrame returned, xrBeginFrame) and whether a submit holds a newly released picture or resubmits the last one.
+// The AirFrameXR fork of VDXR (virtualdesktop-openxr/airframexr_trace.h, deps.lock.json) resolves ovrshim_Trace from this
+// DLL and calls it from the app's xrWaitFrame / xrBeginFrame / xrEndFrame; stock VDXR and libOVR games never call it.
+// Diagnostic only for now: counted and printed with the pacing lines, no behaviour depends on it. Times are OVR seconds.
+namespace vdxrinfo {
+    enum Kind : int { WaitFrameReturn = 1, BeginFrame = 2, EndFrame = 4, FrameContent = 8, FrameCopies = 9 };
+    struct Stats {
+        uint64_t calls{0}, frames{0}, resubmits{0}, slices{0}, released{0}, copied{0}, unchanged{0}, discarded{0};
+        std::vector<float> waitToEndMs, beginToEndMs; // since the last pacing line
+    };
+    struct Frame {
+        long long id{-1};
+        double waitRet{0.0}, begin{0.0};
+    };
+    static std::mutex g_mutex;
+    static Stats g_stats;
+    static Frame g_frames[8]; // frames in flight by id (an app may wait for frame N+1 before it ends N)
+
+    static Frame& Slot(long long id) {
+        Frame& f = g_frames[(unsigned long long)id % 8];
+        if (f.id != id) {
+            f = Frame{};
+            f.id = id;
+        }
+        return f;
+    }
+} // namespace vdxrinfo
+
+extern "C" __declspec(dllexport) void __cdecl ovrshim_Trace(int kind, long long frameId, double now, double a, double b) {
+    using namespace vdxrinfo;
+    std::lock_guard lock(g_mutex);
+    g_stats.calls++;
+    switch (kind) {
+    case WaitFrameReturn:
+        Slot(frameId).waitRet = now;
+        break;
+    case BeginFrame:
+        Slot(frameId).begin = now;
+        g_stats.discarded += a != 0.0 ? 1 : 0;
+        break;
+    case EndFrame: {
+        const Frame& f = Slot(frameId);
+        if (g_stats.waitToEndMs.size() < 4096) {
+            if (f.waitRet > 0.0) {
+                g_stats.waitToEndMs.push_back((float)((now - f.waitRet) * 1000.0));
+            }
+            if (f.begin > 0.0) {
+                g_stats.beginToEndMs.push_back((float)((now - f.begin) * 1000.0));
+            }
+        }
+        break;
+    }
+    case FrameContent: // a = swapchain slices with an image released since the previous frame, b = slices in the frame
+        g_stats.frames++;
+        g_stats.resubmits += (a == 0.0 && b > 0.0) ? 1 : 0;
+        g_stats.released += (uint64_t)a;
+        g_stats.slices += (uint64_t)b;
+        break;
+    case FrameCopies: // a = slices copied into a second OVR swapchain (array slice > 0, MSAA), b = copies skipped (unchanged)
+        g_stats.copied += (uint64_t)a;
+        g_stats.unchanged += (uint64_t)b;
+        break;
+    default: // a newer runtime may send kinds this shim does not know
+        break;
+    }
+}
 
 using namespace ovrnull::driver;
 using namespace ovrnull::log;
@@ -718,8 +889,14 @@ namespace {
                             desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
                             desc.TextureCube.MipLevels = -1;
                         } else {
-                            desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                            desc.Texture2D.MipLevels = -1;
+                            // An array view for every 2D image (one slice for a plain texture): D3D11 has no plain 2D view of a texture
+                            // array, and VDXR hands single-pass stereo swapchains (OpenXR arraySize 2) to us as arrays. The compose
+                            // shaders sample Texture2DArray at the layer's slice (ReprojectPS.hlsl, LayerPS.hlsl).
+                            desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+                            desc.Texture2DArray.MostDetailedMip = 0;
+                            desc.Texture2DArray.MipLevels = -1;
+                            desc.Texture2DArray.FirstArraySlice = 0;
+                            desc.Texture2DArray.ArraySize = std::max<UINT>(1, ovrDesc.ArraySize);
                         }
                         winrt::check_hresult(m_submissionDevice->CreateShaderResourceView(
                             swapchain->textures[i].Get(), &desc, swapchain->SRVs[i].ReleaseAndGetAddressOf()));
@@ -1362,6 +1539,7 @@ namespace {
                             FillColor(mode == TargetMode::DirectEncode, constants.brightness, constants.contrast, constants.saturation,
                                       constants.sharpening, constants.finalPass);
 
+                            constants.slice = (int)LayerSlice(flags, (int)eye, swapchainObject->desc);
                             constants.imageRectNormalized.offset = {
                                 (float)eyeFov->Viewport[eye].Pos.x / swapchainObject->desc.Width,
                                 (float)eyeFov->Viewport[eye].Pos.y / swapchainObject->desc.Height};
@@ -1402,6 +1580,7 @@ namespace {
                         SrgbFlags(mode, IsSrgb(ToDxgiTextureFormat(sc->desc.Format)), c.encodeSrgb, c.decodeSrgb);
                         c.outputGamma = OutputGamma(mode);
                         FillColor(mode == TargetMode::DirectEncode, c.brightness, c.contrast, c.saturation, c.sharpening, c.finalPass);
+                        c.slice = (int)LayerSlice(flags, 0, sc->desc);
                         c.uvOffset = {(float)q.Viewport.Pos.x / sc->desc.Width, (float)q.Viewport.Pos.y / sc->desc.Height};
                         c.uvExtent = {(float)q.Viewport.Size.w / sc->desc.Width, (float)q.Viewport.Size.h / sc->desc.Height};
                         if (isCylinder) {
@@ -1716,6 +1895,25 @@ namespace {
                     memset(m_diagTies, 0, sizeof(m_diagTies));
                     m_diagNoDisplayTime = 0;
                     m_diagSameTs = 0;
+                    vdxrinfo::Stats vs;
+                    {
+                        std::lock_guard vl(vdxrinfo::g_mutex);
+                        vs = vdxrinfo::g_stats;
+                        vdxrinfo::g_stats.waitToEndMs.clear();
+                        vdxrinfo::g_stats.beginToEndMs.clear();
+                    }
+                    if (vs.calls) {
+                        ShimLog("app frames (VDXR): %llu, resubmitted with no new picture %llu, discarded %llu; swapchain slices %llu "
+                                "(newly released %llu, copied into a second swapchain %llu, copy skipped as unchanged %llu); "
+                                "xrWaitFrame return -> xrEndFrame ms p50 %.2f p95 %.2f, xrBeginFrame -> xrEndFrame ms p50 %.2f p95 %.2f",
+                                (unsigned long long)vs.frames, (unsigned long long)vs.resubmits, (unsigned long long)vs.discarded,
+                                (unsigned long long)vs.slices, (unsigned long long)vs.released, (unsigned long long)vs.copied,
+                                (unsigned long long)vs.unchanged, pct(vs.waitToEndMs, 0.5), pct(vs.waitToEndMs, 0.95),
+                                pct(vs.beginToEndMs, 0.5), pct(vs.beginToEndMs, 0.95));
+                    } else if (!m_vdxrInfoNoneLogged) {
+                        m_vdxrInfoNoneLogged = true;
+                        ShimLog("app frames (VDXR): no per-frame facts from the runtime (a libOVR game, or a VDXR build without ovrshim_Trace)");
+                    }
                 }
                 if (m_publishThread.joinable()) {
                     // The host may only read the slot once the GPU is done with it, and that includes the app's own rendering of
@@ -2171,7 +2369,9 @@ namespace {
         void OpenHost() {
             char exe[MAX_PATH] = {};
             GetModuleFileNameA(nullptr, exe, MAX_PATH);
-            if (!OpenIpc(m_ipc)) {
+            const bool opened = OpenIpc(m_ipc);
+            if (opened) shimlog::SetRing(m_ipc.state);   // the shim's lines go to the host from here on
+            if (!opened) {
                 m_ipc = {}; // run standalone (keyboard-driven, like OVRNull)
                 ShimLog("start: %s: host IPC not available (alvr_host not running, or a different IPC version): standalone", exe);
                 shimlog::General("WARN", "AirFrameXR host not reachable (not running, or a different version): this game will not reach the headset");
@@ -2260,18 +2460,15 @@ namespace {
                 }
             }
             const bool restricted = sc[0] < 1.f || sc[1] < 1.f || sc[2] < 1.f || sc[3] < 1.f;
-            // the render quality slider's ceiling: the stream's eye size, or the panel reference the host gives when the stream is fitted to the
-            // headset's visible window (ipc.h renderCeiling); with a ceiling above the stream the slider has room even without a restriction
-            const int ceilW = (h.renderCeilingW > 0 && h.renderCeilingH > 0) ? h.renderCeilingW : 0, ceilH = ceilW ? h.renderCeilingH : 0;
-            const bool lifted = ceilW > h.eyeWidth || ceilH > h.eyeHeight;
-            // not restricted and no ceiling: exactly what it always was (the recommended size is the stream's eye size, whatever its parity)
-            if (initial && (restricted || lifted) && measured && h.eyeWidth > 0 && h.eyeHeight > 0) {
-                const RenderSize rs = GameRenderSize(h.eyeWidth, h.eyeHeight, widthRatio / measured, heightRatio / measured, h.renderQuality, ceilW, ceilH);
+            // not restricted: exactly what it always was (the recommended size is the stream's eye size, whatever its parity); the slider's ceiling is the
+            // stream's eye size (1.4-foundation E4: the panel-reference ceiling above it is gone)
+            if (initial && restricted && measured && h.eyeWidth > 0 && h.eyeHeight > 0) {
+                const RenderSize rs = GameRenderSize(h.eyeWidth, h.eyeHeight, widthRatio / measured, heightRatio / measured, h.renderQuality);
                 m_recommendedResolution = {rs.w, rs.h};
                 {
-                    shimlog::General("INFO", "field of view told to the game: outer %.0f%% inner %.0f%% upper %.0f%% lower %.0f%% of the headset's -> left eye L/R/U/D tan %.3f/%.3f/%.3f/%.3f, recommended %d x %d (stream %d x %d, render quality %.2f, ceiling %d x %d)",
+                    shimlog::General("INFO", "field of view told to the game: outer %.0f%% inner %.0f%% upper %.0f%% lower %.0f%% of the headset's -> left eye L/R/U/D tan %.3f/%.3f/%.3f/%.3f, recommended %d x %d (stream %d x %d, render quality %.2f)",
                                      sc[0] * 100, sc[1] * 100, sc[2] * 100, sc[3] * 100, m_gameFov[0].LeftTan, m_gameFov[0].RightTan, m_gameFov[0].UpTan,
-                                     m_gameFov[0].DownTan, m_recommendedResolution.w, m_recommendedResolution.h, h.eyeWidth, h.eyeHeight, h.renderQuality, ceilW ? ceilW : h.eyeWidth, ceilH ? ceilH : h.eyeHeight);
+                                     m_gameFov[0].DownTan, m_recommendedResolution.w, m_recommendedResolution.h, h.eyeWidth, h.eyeHeight, h.renderQuality);
                 }
             }
             if (initial && h.eyeWidth > 0 && h.eyeHeight > 0) {
@@ -2326,7 +2523,12 @@ namespace {
                 ld.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
                 winrt::check_hresult(m_submissionDevice->CreateTexture2D(&ld, nullptr, m_linearTex.ReleaseAndGetAddressOf()));
                 winrt::check_hresult(m_submissionDevice->CreateRenderTargetView(m_linearTex.Get(), nullptr, m_linearRTV.ReleaseAndGetAddressOf()));
-                winrt::check_hresult(m_submissionDevice->CreateShaderResourceView(m_linearTex.Get(), nullptr, m_linearSRV.ReleaseAndGetAddressOf()));
+                D3D11_SHADER_RESOURCE_VIEW_DESC lsd{};   // an array view: LayerPS samples Texture2DArray (slice 0 here)
+                lsd.Format = ld.Format;
+                lsd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+                lsd.Texture2DArray.MipLevels = 1;
+                lsd.Texture2DArray.ArraySize = 1;
+                winrt::check_hresult(m_submissionDevice->CreateShaderResourceView(m_linearTex.Get(), &lsd, m_linearSRV.ReleaseAndGetAddressOf()));
             }
             D3D11_QUERY_DESC qd{D3D11_QUERY_EVENT, 0};
             winrt::check_hresult(m_submissionDevice->CreateQuery(&qd, m_doneQuery.ReleaseAndGetAddressOf()));
@@ -2845,6 +3047,7 @@ namespace {
         std::atomic<int> m_dupPerReal{0};          // confirmed duplicate pattern: extra submits per real frame (1 or 2), 0 = none (the fix idles)
         std::atomic<int> m_freeBudget{0};          // waits after the last real submit that return at once (WaitForVsync)
         uint64_t m_freeWaits{0};                   // waits of a duplicate cycle returned at once (pacing fix)
+        bool m_vdxrInfoNoneLogged{false};          // the "no per-frame facts from the runtime" line was printed once (vdxrinfo)
         uint64_t m_dupSeen{0}, m_dupDropped{0};    // frames with the previous frame's exact render poses / of those, the ones not published
         std::atomic<double> m_appTimeS{0.004};     // envelope of release -> frame GPU-complete (published), seconds
         long long m_lastTargetBoundary{0};         // boundary (tick index) the last release aimed at: one release per boundary
